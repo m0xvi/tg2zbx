@@ -13,6 +13,7 @@ import getpass
 import html
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -78,7 +79,114 @@ def esc(s) -> str:
 
 
 def cut(text: str, n: int = 3900) -> str:
-    return text if len(text) <= n else text[:n] + "\n…"
+    """Обрезает HTML-сообщение, не разрывая теги/сущности и закрывая теги."""
+    if n <= 0:
+        return ""
+
+    suffix = "\n…" if n >= 2 else "…"
+    token_re = re.compile(
+        r"<[^<>]*>|&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);"
+    )
+    tag_re = re.compile(
+        r"<(?P<closing>/)?(?P<name>[A-Za-z][A-Za-z0-9-]*)"
+        r"(?:\s[^<>]*?)?(?P<self_closing>/)?>"
+    )
+
+    def utf16_units(value: str) -> int:
+        return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+
+    # Разбиваем строку на обычный текст, HTML-сущности и законченные теги.
+    parts = []
+    pos = 0
+    for match in token_re.finditer(text):
+        if match.start() > pos:
+            parts.append(("text", text[pos:match.start()], None))
+        token = match.group()
+        if token.startswith("&"):
+            parts.append(("entity", token, None))
+        else:
+            tag = tag_re.fullmatch(token)
+            if tag:
+                parts.append(("tag", token, (
+                    tag.group("name").lower(),
+                    bool(tag.group("closing")),
+                    bool(tag.group("self_closing")),
+                )))
+            else:
+                parts.append(("text", token, None))
+        pos = match.end()
+    if pos < len(text):
+        parts.append(("text", text[pos:], None))
+
+    visible_units = sum(
+        utf16_units(html.unescape(value))
+        for kind, value, _ in parts if kind != "tag"
+    )
+    if len(text) <= n and visible_units <= n:
+        return text
+
+    def closing_tags(tags: list[str]) -> str:
+        return "".join(f"</{tag}>" for tag in reversed(tags))
+
+    out: list[str] = []
+    stack: list[str] = []
+    raw_units = 0
+    shown_units = 0
+    truncated = False
+
+    def fits(piece: str, added_visible: int, new_stack: list[str]) -> bool:
+        return (
+            raw_units + len(piece) + len(closing_tags(new_stack)) + len(suffix) <= n
+            and shown_units + added_visible + utf16_units(suffix) <= n
+        )
+
+    for kind, value, tag_info in parts:
+        if kind == "text":
+            for char in value:
+                units = utf16_units(html.unescape(char))
+                if not fits(char, units, stack):
+                    truncated = True
+                    break
+                out.append(char)
+                raw_units += len(char)
+                shown_units += units
+            if truncated:
+                break
+            continue
+
+        if kind == "entity":
+            units = utf16_units(html.unescape(value))
+            if not fits(value, units, stack):
+                truncated = True
+                break
+            out.append(value)
+            raw_units += len(value)
+            shown_units += units
+            continue
+
+        name, is_closing, self_closing = tag_info
+        if is_closing:
+            if name in stack:
+                index = len(stack) - 1 - stack[::-1].index(name)
+                new_stack = stack[:index]
+            else:
+                new_stack = stack
+        elif self_closing or name in {"br", "hr", "img", "meta", "link", "input"}:
+            new_stack = stack
+        else:
+            new_stack = [*stack, name]
+
+        if not fits(value, 0, new_stack):
+            truncated = True
+            break
+        out.append(value)
+        raw_units += len(value)
+        stack = new_stack
+
+    if truncated:
+        out.append(suffix)
+        out.append(closing_tags(stack))
+    return "".join(out)
 
 
 def fmt_age(ts) -> str:
